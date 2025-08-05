@@ -591,6 +591,7 @@ int main(int argc, char *argv[]) {
     int score_method = -1; // 0 = leading zeroes, 1 = zeros, 2 = custom prefix
     int mode = 0; // 0 = address, 1 = contract, 2 = create2 contract, 3 = create3 proxy contract
     char* input_file = 0;
+    char* input_bytecode_hash = 0;
     char* input_address = 0;
     char* input_deployer_address = 0;
     char* input_prefix = 0;
@@ -621,6 +622,9 @@ int main(int argc, char *argv[]) {
             i++;
         } else if (strcmp(argv[i], "--bytecode") == 0 || strcmp(argv[i], "-b") == 0) {
             input_file = argv[i + 1];
+            i += 2;
+        } else if (strcmp(argv[i], "--bytecode-hash") == 0 || strcmp(argv[i], "-bh") == 0) {
+            input_bytecode_hash = argv[i + 1];
             i += 2;
         } else if  (strcmp(argv[i], "--address") == 0 || strcmp(argv[i], "-a") == 0) {
             input_address = argv[i + 1];
@@ -685,29 +689,43 @@ int main(int argc, char *argv[]) {
         // Convert hex string to bytes
         memset(parsed_prefix_bytes, 0, 20);
         for (int i = 0; i < prefix_len; i += 2) {
-            char hex_byte[3] = {0};
-            hex_byte[0] = prefix_str[i];
             if (i + 1 < prefix_len) {
-                hex_byte[1] = prefix_str[i + 1];
+                // Even pair - both nibbles
+                char hex_byte[3] = {prefix_str[i], prefix_str[i + 1], 0};
+                parsed_prefix_bytes[i / 2] = (uint8_t)strtol(hex_byte, NULL, 16);
             } else {
-                hex_byte[1] = '0';  // Pad with 0 for odd length
+                // Odd length - only high nibble, leave low nibble as 0
+                char hex_char[2] = {prefix_str[i], 0};
+                uint8_t nibble = (uint8_t)strtol(hex_char, NULL, 16);
+                parsed_prefix_bytes[i / 2] = (nibble << 4);  // Put in high nibble
             }
-            parsed_prefix_bytes[i / 2] = (uint8_t)strtol(hex_byte, NULL, 16);
         }
         
         parsed_prefix_length = prefix_len;
         printf("Looking for addresses starting with '%s' (%d hex digits)\n", prefix_str, prefix_len);
         
-        // Debug: show parsed bytes
+        // Debug: show parsed bytes as they will be matched
         printf("Target bytes: ");
-        for (int i = 0; i < (prefix_len + 1) / 2; i++) {
-            printf("%02x", parsed_prefix_bytes[i]);
+        for (int i = 0; i < prefix_len; i++) {
+            int byte_idx = i / 2;
+            if (i % 2 == 0) {
+                // High nibble
+                printf("%x", (parsed_prefix_bytes[byte_idx] >> 4) & 0xF);
+            } else {
+                // Low nibble
+                printf("%x", parsed_prefix_bytes[byte_idx] & 0xF);
+            }
         }
         printf("\n");
     }
 
-    if (mode == 2 && !input_file) {
-        printf("You must specify contract bytecode when using --contract2\n");
+    if ((mode == 2 || mode == 3) && !input_file && !input_bytecode_hash) {
+        printf("You must specify contract bytecode using --bytecode or --bytecode-hash when using --contract2/--contract3\n");
+        return 1;
+    }
+
+    if ((mode == 2 || mode == 3) && input_file && input_bytecode_hash) {
+        printf("You cannot specify both --bytecode and --bytecode-hash. Choose one.\n");
         return 1;
     }
 
@@ -719,7 +737,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if ((mode == 2 || mode == 3) && !input_deployer_address) {
+    if (mode == 3 && !input_deployer_address) {
         printf("You must specify a deployer address when using --contract3\n");
         return 1;
     }
@@ -735,13 +753,64 @@ int main(int argc, char *argv[]) {
     }
 
     #define nothex(n) ((n < 48 || n > 57) && (n < 65 || n > 70) && (n < 97 || n > 102))
+    
+    // Function to parse hex string to _uint256
+    auto parse_uint256_from_hex = [](const char* hex_str) -> _uint256 {
+        _uint256 result = {0, 0, 0, 0, 0, 0, 0, 0};
+        
+        // Remove 0x prefix if present
+        const char* str = hex_str;
+        if (strncmp(str, "0x", 2) == 0 || strncmp(str, "0X", 2) == 0) {
+            str += 2;
+        }
+        
+        int len = strlen(str);
+        if (len > 64) {
+            printf("Hash too long. Maximum 64 hex characters.\n");
+            return result;
+        }
+        
+        // Validate hex characters
+        for (int i = 0; i < len; i++) {
+            if (nothex(str[i])) {
+                printf("Invalid hex character in hash: '%c'\n", str[i]);
+                return result;
+            }
+        }
+        
+        // Parse from right to left (little endian in the struct)
+        uint32_t* parts[8] = {&result.h, &result.g, &result.f, &result.e, &result.d, &result.c, &result.b, &result.a};
+        
+        for (int i = 0; i < len && i < 64; i++) {
+            int part_idx = i / 8;
+            int nibble_idx = i % 8;
+            
+            char c = str[len - 1 - i];  // Read from right to left
+            uint8_t nibble;
+            if (c >= '0' && c <= '9') nibble = c - '0';
+            else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
+            else nibble = 0;
+            
+            *parts[part_idx] |= (uint32_t)nibble << (nibble_idx * 4);
+        }
+        
+        return result;
+    };
+    
     _uint256 bytecode_hash;
     if (mode == 2 || mode == 3) {
-        std::ifstream infile(input_file, std::ios::binary);
-        if (!infile.is_open()) {
-            printf("Failed to open the bytecode file.\n");
-            return 1;
-        }
+        if (input_bytecode_hash) {
+            // Use direct hash input
+            printf("Using bytecode hash: %s\n", input_bytecode_hash);
+            bytecode_hash = parse_uint256_from_hex(input_bytecode_hash);
+        } else {
+            // Process bytecode file
+            std::ifstream infile(input_file, std::ios::binary);
+            if (!infile.is_open()) {
+                printf("Failed to open the bytecode file.\n");
+                return 1;
+            }
         
         int file_size = 0;
         {
@@ -786,6 +855,7 @@ int main(int argc, char *argv[]) {
         }    
         bytecode_hash = cpu_full_keccak(bytecode, (file_size >> 1) - prefix);
         delete[] bytecode;
+        }  // End of file processing else block
     }
 
     Address origin_address;

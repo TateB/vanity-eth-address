@@ -16,6 +16,7 @@ Vanity Eth Address is a tool to generate Ethereum addresses that match certain c
        (-d) --device <device_number>      Use device <device_number> (Add one for each device for multi-gpu)
        (-p) --prefix <hex_string>         Custom prefix to match (e.g., "1234" or "0x1234", use with --prefix-method)
        (-b) --bytecode <filename>         File containing contract bytecode (only needed when using --contract2 or --contract3)
+      (-bh) --bytecode-hash <hex_hash>    Keccak256 hash of contract bytecode as hex string (alternative to --bytecode)
        (-a) --address <address>           Sender contract address (only needed when using --contract2 or --contract3)
       (-ad) --deployer-address <address>  Deployer contract address (only needed when using --contract3)
        (-w) --work-scale <num>            Defaults to 15. Scales the work done in each kernel. If your GPU finishes kernels within a few seconds, you may benefit from increasing this number.
@@ -23,6 +24,7 @@ Vanity Eth Address is a tool to generate Ethereum addresses that match certain c
 Examples:
     ./vanity-eth-address --zeros --device 0 --device 2 --work-scale 17
     ./vanity-eth-address --leading-zeros --contract2 --bytecode bytecode.txt --address 0x0000000000000000000000000000000000000000 --device 0
+    ./vanity-eth-address --leading-zeros --contract2 --bytecode-hash 0x1234567890abcdef... --address 0x0000000000000000000000000000000000000000 --device 0
     ./vanity-eth-address --prefix-method --prefix 1234 --device 0
     ./vanity-eth-address --prefix-method --prefix 0xdeadbeef --contract --device 0
 ```
