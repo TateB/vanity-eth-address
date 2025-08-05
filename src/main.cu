@@ -49,6 +49,10 @@ __constant__ CurvePoint thread_offsets[BLOCK_SIZE];
 __constant__ CurvePoint addends[THREAD_WORK - 1];
 __device__ uint64_t device_memory[2 + OUTPUT_BUFFER_SIZE * 3];
 
+// Multi-character prefix matching
+__constant__ uint8_t target_prefix_bytes[20];  // Raw bytes for up to 40 hex chars
+__constant__ int prefix_length;
+
 __device__ int count_zero_bytes(uint32_t x) {
     int n = 0;
     n += ((x & 0xFF) == 0);
@@ -89,6 +93,49 @@ __device__ int score_leading_zeros(Address a) {
     return n >> 3;
 }
 
+__device__ int score_custom_prefix(Address a) {
+    // Convert Address to raw bytes for comparison
+    uint8_t addr_bytes[20];
+    
+    // Address struct has 5 uint32_t parts: a, b, c, d, e (big-endian)
+    uint32_t parts[5] = {a.a, a.b, a.c, a.d, a.e};
+    
+    // Convert to bytes (big-endian)
+    for (int i = 0; i < 5; i++) {
+        addr_bytes[i*4 + 0] = (parts[i] >> 24) & 0xFF;
+        addr_bytes[i*4 + 1] = (parts[i] >> 16) & 0xFF;
+        addr_bytes[i*4 + 2] = (parts[i] >> 8) & 0xFF;
+        addr_bytes[i*4 + 3] = (parts[i] >> 0) & 0xFF;
+    }
+    
+    // Compare prefix bytes
+    int matched_nibbles = 0;
+    for (int byte_idx = 0; byte_idx < 20 && matched_nibbles < prefix_length; byte_idx++) {
+        uint8_t addr_byte = addr_bytes[byte_idx];
+        uint8_t target_byte = target_prefix_bytes[byte_idx];
+        
+        // Check high nibble
+        if (matched_nibbles < prefix_length) {
+            if (((addr_byte >> 4) & 0xF) == ((target_byte >> 4) & 0xF)) {
+                matched_nibbles++;
+            } else {
+                break;  // Mismatch, stop checking
+            }
+        }
+        
+        // Check low nibble
+        if (matched_nibbles < prefix_length) {
+            if ((addr_byte & 0xF) == (target_byte & 0xF)) {
+                matched_nibbles++;
+            } else {
+                break;  // Mismatch, stop checking
+            }
+        }
+    }
+    
+    return matched_nibbles;
+}
+
 #ifdef __linux__
     #define atomicMax_ul(a, b) atomicMax((unsigned long long*)(a), (unsigned long long)(b))
     #define atomicAdd_ul(a, b) atomicAdd((unsigned long long*)(a), (unsigned long long)(b))
@@ -101,6 +148,7 @@ __device__ void handle_output(int score_method, Address a, uint64_t key, bool in
     int score = 0;
     if (score_method == 0) { score = score_leading_zeros(a); }
     else if (score_method == 1) { score = score_zero_bytes(a); }
+    else if (score_method == 2) { score = score_custom_prefix(a); }
 
     if (score >= device_memory[1]) {
         atomicMax_ul(&device_memory[1], score);
@@ -119,6 +167,7 @@ __device__ void handle_output2(int score_method, Address a, uint64_t key) {
     int score = 0;
     if (score_method == 0) { score = score_leading_zeros(a); }
     else if (score_method == 1) { score = score_zero_bytes(a); }
+    else if (score_method == 2) { score = score_custom_prefix(a); }
 
     if (score >= device_memory[1]) {
         atomicMax_ul(&device_memory[1], score);
@@ -177,7 +226,7 @@ uint64_t milliseconds() {
 }
 
 
-void host_thread(int device, int device_index, int score_method, int mode, Address origin_address, Address deployer_address, _uint256 bytecode) {
+void host_thread(int device, int device_index, int score_method, int mode, Address origin_address, Address deployer_address, _uint256 bytecode, uint8_t* prefix_bytes, int prefix_len) {
     uint64_t GRID_WORK = ((uint64_t)BLOCK_SIZE * (uint64_t)GRID_SIZE * (uint64_t)THREAD_WORK);
 
     CurvePoint* block_offsets = 0;
@@ -201,8 +250,19 @@ void host_thread(int device, int device_index, int score_method, int mode, Addre
     output_buffer3_host = output_buffer2_host + OUTPUT_BUFFER_SIZE;
 
     output_counter_host[0] = 0;
-    max_score_host[0] = 2;
+    if (score_method == 2) {
+        max_score_host[0] = prefix_len;  // For custom prefix, need exact match
+    } else {
+        max_score_host[0] = 2;  // For other methods, keep original threshold
+    }
     gpu_assert(cudaMemcpyToSymbol(device_memory, device_memory_host, 2 * sizeof(uint64_t)));
+    
+    // Copy prefix data to device constants if using custom prefix method
+    if (score_method == 2) {
+        gpu_assert(cudaMemcpyToSymbol(target_prefix_bytes, prefix_bytes, 20 * sizeof(uint8_t)));
+        gpu_assert(cudaMemcpyToSymbol(prefix_length, &prefix_len, sizeof(int)));
+    }
+    
     gpu_assert(cudaDeviceSynchronize())
 
 
@@ -528,11 +588,12 @@ void print_speeds(int num_devices, int* device_ids, double* speeds) {
 
 
 int main(int argc, char *argv[]) {
-    int score_method = -1; // 0 = leading zeroes, 1 = zeros
+    int score_method = -1; // 0 = leading zeroes, 1 = zeros, 2 = custom prefix
     int mode = 0; // 0 = address, 1 = contract, 2 = create2 contract, 3 = create3 proxy contract
     char* input_file = 0;
     char* input_address = 0;
     char* input_deployer_address = 0;
+    char* input_prefix = 0;
 
     int num_devices = 0;
     int device_ids[10];
@@ -546,6 +607,8 @@ int main(int argc, char *argv[]) {
             i++;
         } else if (strcmp(argv[i], "--zeros") == 0 || strcmp(argv[i], "-z") == 0) {
             score_method = 1;
+        } else if (strcmp(argv[i], "--prefix-method") == 0) {
+            score_method = 2;
             i++;
         } else if (strcmp(argv[i], "--contract") == 0 || strcmp(argv[i], "-c") == 0) {
             mode = 1;
@@ -565,6 +628,9 @@ int main(int argc, char *argv[]) {
         } else if  (strcmp(argv[i], "--deployer-address") == 0 || strcmp(argv[i], "-da") == 0) {
             input_deployer_address = argv[i + 1];
             i += 2;
+        } else if (strcmp(argv[i], "--prefix") == 0) {
+            input_prefix = argv[i + 1];
+            i += 2;
         } else if  (strcmp(argv[i], "--work-scale") == 0 || strcmp(argv[i], "-w") == 0) {
             GRID_SIZE = 1U << atoi(argv[i + 1]);
             i += 2;
@@ -581,6 +647,63 @@ int main(int argc, char *argv[]) {
     if (score_method == -1) {
         printf("No scoring method was specified\n");
         return 1;
+    }
+
+    // Variables for custom prefix parsing
+    uint8_t parsed_prefix_bytes[20] = {0};
+    int parsed_prefix_length = 0;
+
+    // Validate and parse custom prefix if using prefix method
+    if (score_method == 2) {
+        if (!input_prefix) {
+            printf("--prefix must be specified when using --prefix-method\n");
+            return 1;
+        }
+        
+        // Remove 0x prefix if present
+        char* prefix_str = input_prefix;
+        if (strncmp(prefix_str, "0x", 2) == 0 || strncmp(prefix_str, "0X", 2) == 0) {
+            prefix_str += 2;
+        }
+        
+        // Support multi-character prefixes, minimum 6 characters
+        int prefix_len = strlen(prefix_str);
+        if (prefix_len < 6 || prefix_len > 40) {
+            printf("Prefix must be between 6 and 40 hex characters\n");
+            return 1;
+        }
+        
+        // Validate all characters are hex
+        for (int i = 0; i < prefix_len; i++) {
+            char c = prefix_str[i];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                printf("Prefix must contain only hex characters (0-9, a-f, A-F)\n");
+                return 1;
+            }
+        }
+        
+        // Convert hex string to bytes
+        memset(parsed_prefix_bytes, 0, 20);
+        for (int i = 0; i < prefix_len; i += 2) {
+            char hex_byte[3] = {0};
+            hex_byte[0] = prefix_str[i];
+            if (i + 1 < prefix_len) {
+                hex_byte[1] = prefix_str[i + 1];
+            } else {
+                hex_byte[1] = '0';  // Pad with 0 for odd length
+            }
+            parsed_prefix_bytes[i / 2] = (uint8_t)strtol(hex_byte, NULL, 16);
+        }
+        
+        parsed_prefix_length = prefix_len;
+        printf("Looking for addresses starting with '%s' (%d hex digits)\n", prefix_str, prefix_len);
+        
+        // Debug: show parsed bytes
+        printf("Target bytes: ");
+        for (int i = 0; i < (prefix_len + 1) / 2; i++) {
+            printf("%02x", parsed_prefix_bytes[i]);
+        }
+        printf("\n");
     }
 
     if (mode == 2 && !input_file) {
@@ -718,7 +841,7 @@ int main(int argc, char *argv[]) {
     std::vector<std::thread> threads;
     uint64_t global_start_time = milliseconds();
     for (int i = 0; i < num_devices; i++) {
-        std::thread th(host_thread, device_ids[i], i, score_method, mode, origin_address, deployer_address, bytecode_hash);
+        std::thread th(host_thread, device_ids[i], i, score_method, mode, origin_address, deployer_address, bytecode_hash, parsed_prefix_bytes, parsed_prefix_length);
         threads.push_back(move(th));
     }
 
